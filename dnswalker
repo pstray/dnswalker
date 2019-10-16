@@ -1,0 +1,108 @@
+#! /usr/bin/perl
+
+use Net::DNS;
+use Data::Dumper;
+
+$Data::Dumper::Sortkeys = $Data::Dumper::Indent = 1;
+
+my %data;
+my %resolvers;
+
+# we need to find the root servers...
+find_ns(".");
+
+for my $zone (@ARGV) {
+    walk($zone);
+}
+
+print Dumper \%data, [ keys %resolvers ];
+
+
+
+exit;
+
+sub walk {
+    my($zone) = @_;
+
+    # find the path.
+    $zone =~ s/\.*$/./;
+    my @path = ();
+    while ($zone =~ s/([^.]+\.)$//) {
+	push @path, $1.$path[-1];
+    }
+    $zone = @path[-1];
+    unshift @path, '.';
+
+    my $parent = '.';
+    for my $z (@path) {
+	printf "ZZZ:::: %s\n", $z;
+	my $r = resolvers($parent);
+	find_ns($z, $r);
+	$parent = $z;
+
+	print Dumper \%data;
+    }
+}
+
+sub resolvers {
+    my($zone) = @_;
+    my $r;
+
+    if (exists $data{$zone} && $data{$zone}{NS}) {
+	printf "ZZZ::: whoho %s\n", $zone;
+
+	for my $ns (keys %{$data{$zone}{NS}}) {
+	    for my $ip (keys %{$data{$ns}{A}}) {
+		$r->{$ip} =
+		  $resolver{$ip} ||= Net::DNS::Resolver
+		  ->new( nameservers => [ $ip ],
+			 recurse => 0,
+			 # debug => 1,
+		       );
+	    }
+	}
+    }
+
+    $r->{local} = Net::DNS::Resolver->new(debug => 1) unless keys %$r;
+    return $r
+}
+
+sub find_ns {
+    my($search, $resolvers) = @_;
+
+    for my $src (keys %$resolvers) {
+	my $resolver = $resolvers->{$src};
+
+	printf "IIIII: Looking up %s on %s\n", $search,
+	  join ",", $resolver->nameservers;
+	$resolver->print();
+	store_query($resolver, $search, 'NS');
+
+	for my $ns (keys %{$data{$search}{NS}}) {
+	    store_query($resolver, $ns, 'A');
+	}
+    }
+}
+
+sub store_query {
+    my($resolver, $search, $type) = @_;
+
+    printf "IIIII: Looking up %s for %s on %s\n", $type, $search,
+      join ",", $resolver->nameservers;
+
+
+    my $src = join ",", sort $resolver->nameservers();
+    my $resp = $resolver->send($search, $type);
+    if ($resp) {
+	printf "RRRRR: got responses from %s\n", $src;
+	for my $rr ($resp->answer, $resp->authority, $resp->additional) {
+	    my($o,$t,$ns) = ($rr->owner, $rr->type, $rr->rdstring);
+	    print "XXXX: $o $t $ns\n";
+	    $o =~ s/\.*$/./;
+	    $data{$o}{$t}{$ns}{$src}++;
+	}
+    }
+    else {
+	printf "EEEEE: %s\n", $resolver->errorstring
+    }
+}
