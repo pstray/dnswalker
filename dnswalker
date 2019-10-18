@@ -99,7 +99,7 @@ sub store_query {
 
 	my $resp = $resolver->send($search, $search_type);
 	if ($resp) {
-	    log_msg("  Got responses from %s", $source);
+	    #log_msg("  Got responses from %s", $source);
 	    for my $rr ($resp->answer, $resp->authority, $resp->additional) {
 
 		my($owner,$type,$rdata) = ($rr->owner, $rr->type, $rr->rdstring);
@@ -109,7 +109,7 @@ sub store_query {
 		    s/\.*$/./;
 		}
 
-		#log_msg("Got: %s %s %s", $owner, $type, $rdata);
+		log_msg("  Got: %s %s %s", $owner, $type, $rdata);
 
 		$insert_rr->execute($owner, $rr->ttl, $rr->class, $type,
 				    $rdata, $zone, $source);
