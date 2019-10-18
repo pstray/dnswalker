@@ -1,108 +1,257 @@
 #! /usr/bin/perl
 
+use v5.10;
+use strict;
 use Net::DNS;
-use Data::Dumper;
+use POSIX;
+use Time::HiRes qw(time);
+use DBI;
 
+
+use Data::Dumper;
 $Data::Dumper::Sortkeys = $Data::Dumper::Indent = 1;
 
-my %data;
 my %resolvers;
+my %state;
 
-# we need to find the root servers...
-find_ns(".");
+my $have_ipv6 = 0;
+
+my $dbname = strftime("dnswalker-%Y%m%d-%H%M%S-$$.sqlite", localtime);
+my $dbname = "dnswalker.sqlite";
+
+my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname", "", "",
+		       { sqlite_unicode => 1,
+			 PrintError => 0,
+			 RaiseError => 1,
+		       }
+		      );
+
+$dbh->do(qq{
+CREATE TABLE IF NOT EXISTS dns_cache (
+    name	VARCHAR		NOT NULL,
+    ttl		NUMBER		NULL,
+    class	VARCHAR		NOT NULL DEFAULT 'IN',
+    type	VARCHAR		NOT NULL,
+    data	VARCHAR		NOT NULL,
+    zone	VARCHAR		NOT NULL,
+    source	VARCHAR		NOT NULL,
+
+    updated     DATETIME	DEFAULT CURRENT_TIMESTAMP,
+
+    primary key (name, class, type, data, source)
+);});
+
+my %db_cache;
+
+my $insert_rr = $dbh->prepare(qq{
+INSERT OR REPLACE INTO
+dns_cache (name, ttl, class, type, data, zone, source)
+VALUES    (?,    ?,   ?,     ?,    ?,    ?,    ?);
+});
+
+my $get_ns_for_zone = $dbh->prepare(qq{
+SELECT *
+FROM dns_cache ns
+WHERE ns.type = 'NS'
+  AND ns.zone = ?
+order by 1
+});
+
+$| = 1;
+
+load_root_ns();
 
 for my $zone (@ARGV) {
-    walk($zone);
+    check_zone($zone);
 }
 
-print Dumper \%data, [ keys %resolvers ];
-
-
+print Dumper \%state, [ \%resolvers ];
 
 exit;
 
-sub walk {
-    my($zone) = @_;
+# --------------------------------------------------------------------------
 
-    # find the path.
-    $zone =~ s/\.*$/./;
-    my @path = ();
-    while ($zone =~ s/([^.]+\.)$//) {
-	push @path, $1.$path[-1];
-    }
-    $zone = @path[-1];
-    unshift @path, '.';
+sub load_root_ns {
+    my $local_resolver = Net::DNS::Resolver->new();
+    store_query(LOCAL => $local_resolver, '.', 'NS');
 
-    my $parent = '.';
-    for my $z (@path) {
-	printf "ZZZ:::: %s\n", $z;
-	my $r = resolvers($parent);
-	find_ns($z, $r);
-	$parent = $z;
-
-	print Dumper \%data;
-    }
-}
-
-sub resolvers {
-    my($zone) = @_;
-    my $r;
-
-    if (exists $data{$zone} && $data{$zone}{NS}) {
-	printf "ZZZ::: whoho %s\n", $zone;
-
-	for my $ns (keys %{$data{$zone}{NS}}) {
-	    for my $ip (keys %{$data{$ns}{A}}) {
-		$r->{$ip} =
-		  $resolver{$ip} ||= Net::DNS::Resolver
-		  ->new( nameservers => [ $ip ],
-			 recurse => 0,
-			 # debug => 1,
-		       );
-	    }
-	}
+    $get_ns_for_zone->execute('.');
+    while (my $row = $get_ns_for_zone->fetchrow_hashref) {
+	store_query(LOCAL => $local_resolver, $row->{data}, 'A', 'AAAA');
     }
 
-    $r->{local} = Net::DNS::Resolver->new(debug => 1) unless keys %$r;
-    return $r
-}
-
-sub find_ns {
-    my($search, $resolvers) = @_;
-
-    for my $src (keys %$resolvers) {
-	my $resolver = $resolvers->{$src};
-
-	printf "IIIII: Looking up %s on %s\n", $search,
-	  join ",", $resolver->nameservers;
-	$resolver->print();
-	store_query($resolver, $search, 'NS');
-
-	for my $ns (keys %{$data{$search}{NS}}) {
-	    store_query($resolver, $ns, 'A');
-	}
-    }
+    $state{WALK}{'.'}{checked} = 1;
 }
 
 sub store_query {
-    my($resolver, $search, $type) = @_;
+    my($source, $resolver, $search, @search_type) = @_;
 
-    printf "IIIII: Looking up %s for %s on %s\n", $type, $search,
-      join ",", $resolver->nameservers;
+    for my $search_type (@search_type) {
 
+	if ($state{$source}{$search}{$search_type}++) {
+	    next;
+	}
 
-    my $src = join ",", sort $resolver->nameservers();
-    my $resp = $resolver->send($search, $type);
-    if ($resp) {
-	printf "RRRRR: got responses from %s\n", $src;
-	for my $rr ($resp->answer, $resp->authority, $resp->additional) {
-	    my($o,$t,$ns) = ($rr->owner, $rr->type, $rr->rdstring);
-	    print "XXXX: $o $t $ns\n";
-	    $o =~ s/\.*$/./;
-	    $data{$o}{$t}{$ns}{$src}++;
+	log_msg("Looking up %s for %s from %s",
+		$search_type,
+		$search,
+		$source);
+
+	my $resp = $resolver->send($search, $search_type);
+	if ($resp) {
+	    log_msg("  Got responses from %s", $source);
+	    for my $rr ($resp->answer, $resp->authority, $resp->additional) {
+
+		my($owner,$type,$rdata) = ($rr->owner, $rr->type, $rr->rdstring);
+		my $zone = $owner;
+		$zone =~ s/^[^.]+[.]//;
+		for ($owner, $zone) {
+		    s/\.*$/./;
+		}
+
+		#log_msg("Got: %s %s %s", $owner, $type, $rdata);
+
+		$insert_rr->execute($owner, $rr->ttl, $rr->class, $type,
+				    $rdata, $zone, $source);
+	    }
+	}
+	else {
+	    my $e = $resolver->errorstring;
+	    $state{ERROR}{$source}{$search}{$search_type} = $e;
+	    log_msg("Error: %s", $e);
 	}
     }
-    else {
-	printf "EEEEE: %s\n", $resolver->errorstring
+}
+
+sub check_zone {
+    my($zone) = @_;
+
+    # find ns for the zone (walk from the top)
+    walk_ns_path($zone);
+
+}
+
+sub walk_ns_path {
+    my($zone) = @_;
+    my(@path) = split_zone($zone);
+
+    my $parent = '.';
+    for my $search (@path) {
+	if ($state{WALK}{$search}{checked}) {
+	    log_msg("Already checked %s", $search);
+	    next;
+	}
+
+	if ($state{WALK}{$search}{checking}++) {
+	    log_msg("Currently checking %s", $search);
+	    next;
+	}
+
+	# look up all NS for zone via parent
+	log_msg("looking up NS for %s via %s", $search, $parent);
+
+	my $resolvers = get_resolvers($parent);
+	unless ($resolvers) {
+	    warn "No resolvers for zone: $parent\n";
+	    last;
+	}
+
+	for my $source (keys %$resolvers) {
+	    my $resolver = $resolvers->{$source};
+
+	    #$resolver->print();
+	    store_query($source => $resolver,
+			$search, 'NS',
+		       );
+
+	    # walk the path for all of the nameservers found
+	    $get_ns_for_zone->execute($search);
+	    my @ns;
+	    while (my $row = $get_ns_for_zone->fetchrow_hashref) {
+		push @ns, $row->{data};
+	    }
+
+	    for my $ns (@ns) {
+		my(@ns_path) = split_zone($ns);
+		pop @ns_path;
+		walk_ns_path($ns_path[-1]);
+
+		# her spør vi om limet
+		store_query($source => $resolver,
+			    $ns, 'A', 'AAAA',
+			   );
+
+	    }
+	}
+
+	print Data::Dumper->Dump([ \%state ],
+				 [qw(state)]
+				);
+
+	$state{WALK}{$search}{checked} = 'done';
+	$parent = $search;
     }
 }
+
+sub split_zone {
+    my($zone) = @_;
+    my @path;
+    $zone =~ s/\.*$/./;
+    while ($zone =~ s/([^.]+\.)$//) {
+	push @path, $1.$path[-1];
+    }
+    unshift @path, '.';
+    return @path;
+}
+
+sub log_msg {
+    my($fmt, @args) = @_;
+    my $time = time;
+    printf("%s.%09d: $fmt\n",
+	   strftime("%F %T", localtime $time),
+	   ($time-int($time))*1000000000,
+	   @args);
+}
+
+sub get_resolvers {
+    my($zone) = @_;
+
+    state $get_ns_addr ||= $dbh->prepare(qq{
+SELECT ns.data as host, ip.type, ip.data as ip
+FROM dns_cache ns
+LEFT JOIN (select * from dns_cache where type in ('A','AAAA')) ip
+ON ns.data = ip.name
+WHERE ns.type = 'NS'
+  AND ns.zone = ?
+order by 1
+});
+
+    $get_ns_addr->execute($zone);
+    while (my $row = $get_ns_addr->fetchrow_hashref) {
+	next if !$have_ipv6 && $row->{type} eq 'AAAA';
+	my $ns = $row->{host};
+	my $addr = $row->{ip};
+	my $src = "$ns/$addr";
+
+	$resolvers{$zone}{$src} ||= Net::DNS::Resolver
+	  ->new( nameservers => [ $addr ],
+		 recurse => 0,
+		 # debug => 1,
+	       );
+    }
+
+    return %resolvers{$zone};
+}
+
+# --------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+__END__
