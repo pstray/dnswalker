@@ -1,1 +1,2 @@
-dnswalker.sqlite
+dnswalker*.sqlite
+dnswalker*.log
