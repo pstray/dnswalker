@@ -1,0 +1,16 @@
+#! /usr/bin/perl
+
+use strict;
+
+my @use_list;
+while (<>) {
+    s/^\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d+: //;
+    if (/^  Got:/) {
+	push @use_list, $_;
+    }
+    else {
+	print sort @use_list;
+	@use_list = ();
+	print;
+    }
+}
